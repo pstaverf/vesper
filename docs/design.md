@@ -1,0 +1,179 @@
+# Vesper — архитектура (этап 0)
+
+Реализация: Rust (edition 2021), один бинарник `vesper`.
+
+Расширение исходников: `.vx` (см. раздел «Противоречия»).
+
+## Противоречия в задании
+
+1. Расширение файлов указано дважды и по-разному: `.vx` (раздел 1) и `.vsp` (разделы 2, 4, 7). Принято `.vx` как в разделе «О языке»: `bot.vx`, `vesper run bot.vx`. Если нужно `.vsp` — скажи до этапа 1, лексеру всё равно, меняется только CLI и примеры.
+2. Язык реализации: в первом сообщении `[Rust]`, во втором `[УКАЗАТЬ: Python / Node.js / Go / Rust]`. Принято Rust.
+3. В разделе 1 написано `vesper run bot.vx`, в разделе 4 этапа 7 — перезапуск «при изменении `.vsp`». Принято: следим за расширением `.vx`.
+4. Требование «неизвестные поля в ответах сохраняются и доступны в Vesper» и «типы генерируются из спецификации» частично противоречат: жёстко сгенерированные структуры отбрасывают неизвестные поля. Решение: значения Telegram в Vesper — это динамические словари (`Map`) с сохранением всех полей как есть; сгенерированный слой — это таблица методов и полей для проверки аргументов и подсказок, а не сериализуемые структуры. Так обновление API не ломает старые боты и не теряет новые поля.
+
+## Архитектура
+
+```
+.vx ──lexer──> Vec<Token> ──parser──> Program(AST) ──interp──> Value
+                                                        │
+                                                        └── tg::Backend (trait)
+                                                              ├── HttpBackend  (реальная сеть)
+                                                              └── MockBackend  (тесты)
+```
+
+Поток выполнения бота:
+
+```
+Updater (poll | webhook) ──> Update(Map) ──> Router ──> HandlerRef ──> Interpreter
+                                  │                                      │
+                                  └────────── ctx: msg, upd, cb, args ───┘
+```
+
+Ядро (лексер, парсер, интерпретатор) не знает про Telegram: единственный мост — трейт `Backend`
+с методами `call(method, params, files) -> Value` и `poll(offset, timeout) -> Vec<Value>`.
+Слой API подключается только в `tg/` и в генераторе.
+
+Сквозные правила:
+
+- Все значения — `Value`: `Null | Bool | Int(i64) | Float(f64) | Str(String) | List(Vec<Value>) | Map(BTreeMap<String, Value>)`.
+- `Map` хранит всё, что пришло из Telegram, включая незнакомые поля. Доступ к отсутствующему полю даёт `null`, а не ошибку.
+- Ошибки языка: `файл:строка:колонка: ошибка: текст` + строка исходника и подчёркивание. Ошибка парсинга фатальна; ошибка времени выполнения в обработчике печатается и обновление пропускается, бот продолжает работу (`--strict` — завершиться).
+- Сеть: таймаут на каждый запрос, `429` → пауза `retry_after`, `5xx`/таймаут → экспоненциальный повтор (0.5s, 1s, 2s, 4s, до 5 попыток), затем ошибка.
+- Токен: `VESPER_TOKEN`, затем `TELEGRAM_BOT_TOKEN`, затем `BOT_TOKEN` из окружения или из `.env` рядом с файлом бота. В коде бота токена нет.
+
+## Зависимости и зачем
+
+| Крейт | Зачем | Почему не std |
+|---|---|---|
+| `serde_json` | разбор/сборка JSON Bot API, сохранение неизвестных полей | писать свой JSON-парсер — 400+ строк и баги на Unicode-эскейпах |
+| `ureq` (rustls) | HTTP-клиент для Bot API и скачивания спецификации | std не умеет HTTP; rustls убирает зависимость от OpenSSL при статической сборке |
+| `tiny_http` | webhook-сервер (этап 5) | std нет HTTP-сервера; крейт ~без зависимостей |
+
+CLI-аргументы, `.env`, слежение за файлом, diff — своим кодом, без `clap`/`dotenv`/`notify`.
+Точные версии фиксируются в `Cargo.lock` на этапе 1.
+
+## Дерево проекта
+
+```
+vesper/
+├── Cargo.toml
+├── Cargo.lock
+├── README.md
+├── .gitignore
+├── docs/
+│   ├── design.md
+│   └── syntax.md
+├── examples/
+│   ├── 01_start.vx
+│   ├── 02_buttons.vx
+│   ├── 03_states.vx
+│   ├── 04_callback_edit.vx
+│   └── 05_photo.vx
+├── api/
+│   ├── api_version.json
+│   ├── spec.json          # снимок community-спецификации
+│   ├── changelog.md       # журнал изменений API
+│   └── history/           # предыдущие слои для отката
+├── tools/
+│   └── gen_api/           # отдельный bin: tools/gen_api
+│       ├── Cargo.toml
+│       └── src/main.rs
+├── src/
+│   ├── main.rs            # точка входа, разбор argv
+│   ├── cli.rs             # run, check, dev, version, update-api, new
+│   ├── diag.rs            # ошибки с позицией, рендер подчёркивания
+│   ├── lexer/
+│   │   ├── mod.rs
+│   │   ├── token.rs
+│   │   └── tests.rs
+│   ├── parser/
+│   │   ├── mod.rs
+│   │   ├── ast.rs
+│   │   └── tests.rs
+│   ├── interp/
+│   │   ├── mod.rs
+│   │   ├── value.rs
+│   │   ├── env.rs
+│   │   ├── builtins.rs
+│   │   └── tests.rs
+│   ├── json.rs            # Value <-> serde_json, стабильный порядок ключей
+│   ├── tg/
+│   │   ├── mod.rs         # Backend trait, общий клиент
+│   │   ├── gen.rs         # СГЕНЕРИРОВАНО, не править руками
+│   │   ├── call.rs        # call(method, params) + проверка по слою
+│   │   ├── poll.rs        # getUpdates с offset/таймаутом
+│   │   ├── webhook.rs     # режим webhook
+│   │   └── tests.rs       # MockBackend
+│   ├── router.rs          # маршрутизация Update -> обработчик
+│   ├── state.rs           # состояния и данные пользователей (память/файл)
+│   └── update_api.rs      # update-api: скачать, diff, подтвердить, откатить
+└── tests/
+    ├── lexer.rs
+    ├── parser.rs
+    ├── interp.rs
+    └── e2e_mock.rs
+```
+
+`api/spec.json` — снимок спецификации (лежит в репозитории, чтобы сборка не ходила в сеть).
+Источник: community-спецификация `github.com/PaulSonOfLars/telegram-bot-api-spec` (MIT, обновляется ежедневно, машиночитаемый JSON). Проверено вживую 2026-11-23: `version = "Bot API 10.5"`, `release_date = "November 22, 2026"`, 194 метода, 426 типов. Формат: `{version, release_date, changelog, methods:{имя:{fields:[{name,types[],required,description}], returns[]}}, types:{...}}`; типы значений — `Integer`, `Float`, `String`, `Boolean`, `Array of X`.
+
+## Слой API и обновляемость
+
+`tools/gen_api` (Rust bin, входит в workspace) читает `api/spec.json`:
+
+1. Проверяет версию и `release_date`.
+2. Строит методы: имя, `returns`, параметры `{name, types, required}`.
+3. Строит типы: имя, поля, признак union (`subtypes`) и `Array of` внутри полей.
+4. Пишет `src/tg/gen.rs` (статические таблицы: `METHODS`, `TYPES`, const-имена методов).
+5. Пишет/обновляет `api/api_version.json`.
+6. Неразобранное поле или метод → предупреждение в stderr с именем метода и пропуск, код генерации 0.
+
+Формат `api/api_version.json`:
+
+```json
+{
+  "bot_api": "10.5",
+  "release_date": "2026-11-22",
+  "source": "https://github.com/PaulSonOfLars/telegram-bot-api-spec",
+  "source_sha256": "<sha256 api.min.json>",
+  "generated_at": "2026-11-23T07:40:00Z",
+  "generator": "0.1.0",
+  "methods": 194,
+  "types": 426,
+  "warnings": 0
+}
+```
+
+Универсальный вызов:
+
+```
+res = call("sendMessage", {"chat_id": chat, "text": "ok"})
+```
+
+- Метод, которого нет в слое, вызывается всё равно (с предупреждением при `--strict`).
+- Аргументы проверяются по слою: неизвестный параметр или неверный тип — предупреждение, запрос не блокируется.
+- Ответ: `Map` как есть; неизвестные поля остаются; `ok = false` → `Error` с `description` и `error_code`.
+- Путь: `call(...)` → `{base}/bot{token}/{method}` → разбор `{ok, result, description}`.
+
+`vesper update-api`:
+
+1. Скачивает `api.min.json` во временный файл, сверяет `sha256` при повторном запуске.
+2. Генерирует новый слой в `tmp/gen_new.rs`.
+3. Diff по структурам: `+ метод`, `- метод`, `~ метод: +параметр/-параметр/смена типа`, то же для типов.
+4. Печатает diff и спрашивает подтверждение (`y/N`), при отказе ничего не меняет.
+5. При подтверждении: текущий `gen.rs` → `api/history/gen-<версия>-<время>.rs`, пишет новую версию, обновляет `api_version.json`, дописывает запись в `api/changelog.md`.
+6. `vesper update-api --rollback` возвращает предыдущий слой из `api/history/`.
+
+## План этапов (фиксируем заранее)
+
+| Этап | Итог | Приёмка |
+|---|---|---|
+| 1 | лексер | токены с позицией, INDENT/DEDENT, строки/числа/комментарии, тесты |
+| 2 | парсер + AST | грамматика из `docs/syntax.md`, ошибки с позицией, тесты на битый код |
+| 3 | интерпретатор ядра | переменные, условия, циклы, функции, списки, словари, строки, builtins ядра |
+| 4 | слой API | `tools/gen_api`, `gen.rs`, `call`, `api_version.json`, тесты на моках |
+| 5 | обновления | long polling с offset и backoff, webhook, корректный выход по Ctrl+C |
+| 6 | связка языка и Telegram | обработчики, builtins отправки, состояния в памяти и файле |
+| 7 | CLI | `run`, `check`, `version`, `update-api`, `new`, `dev` с перезапуском |
+| 8 | механизм обновления | diff, подтверждение, откат, журнал |
+| 9 | финал | полный набор тестов, README, статическая сборка |

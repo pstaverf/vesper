@@ -1,0 +1,15 @@
+bot "Счётчик"
+
+on command "start":
+    send("Нажми кнопку", inline = inline[["+1" -> "inc"]])
+
+on callback "inc":
+    n = load("count") ?? 0
+    n = n + 1
+    save("count", n)
+    edit("Нажато раз: " + str(n), inline = inline[["+1" -> "inc"]])
+    answer()
+
+on command "reset":
+    save("count", 0)
+    send("Счётчик сброшен")

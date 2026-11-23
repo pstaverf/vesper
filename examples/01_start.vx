@@ -1,0 +1,9 @@
+bot "Приветственный бот"
+
+on command "start":
+    name = msg.from.first_name ?? "друг"
+    send("Привет, {name}! Я бот на Vesper.")
+    send("Напиши что-нибудь, и я повторю.")
+
+on text:
+    send("Ты написал: " + text)

@@ -1,0 +1,26 @@
+bot "Знакомство"
+
+on command "start":
+    set_state("name")
+    send("Как тебя зовут?")
+
+state "name":
+    on text:
+        save("name", text)
+        set_state("city")
+        send("Приятно познакомиться, {text}. Из какого ты города?")
+
+state "city":
+    on text:
+        save("city", text)
+        set_state(null)
+        n = load("name")
+        send("Записал: " + n + " из города " + text)
+
+on command "profile":
+    n = load("name")
+    if n == null:
+        send("Профиля нет. Начни с /start")
+    else:
+        c = load("city")
+        send("Имя: " + n + "\nГород: " + c)

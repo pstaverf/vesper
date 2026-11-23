@@ -1,0 +1,21 @@
+bot "Магазин"
+
+prices = {"coffee": 250, "tea": 150}
+
+on command "start":
+    kb = inline[
+        ["Кофе" -> "buy:coffee", "Чай" -> "buy:tea"],
+        ["Сайт" -> link "https://example.com"]
+    ]
+    send("Что берём?", inline = kb)
+
+on callback "buy:coffee":
+    answer("Добавлено")
+    send("Кофе — " + str(prices["coffee"]) + " ₸")
+
+on callback "buy:tea":
+    answer("Добавлено")
+    send("Чай — " + str(prices["tea"]) + " ₸")
+
+on command "menu":
+    send("Выбери:", menu = menu[["Меню", "Помощь"]])
