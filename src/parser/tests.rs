@@ -511,6 +511,31 @@ fn ошибка_выражение_из_ключевого_слова() {
 }
 
 #[test]
+fn ошибка_state_в_позиции_операнда() {
+    let d = bad("on text:\n    if state == \"x\":\n        send(\"a\")\n");
+    assert!(
+        d.text
+            .contains("'state' здесь не переменная, используй get_state()"),
+        "{}",
+        d.text
+    );
+    let d = bad("x = state\n");
+    assert!(
+        d.text
+            .contains("'state' здесь не переменная, используй get_state()"),
+        "{}",
+        d.text
+    );
+    let d = bad("x = 1 + state\n");
+    assert!(
+        d.text
+            .contains("'state' здесь не переменная, используй get_state()"),
+        "{}",
+        d.text
+    );
+}
+
+#[test]
 fn ошибка_else_без_if() {
     let d = bad("else:\n    x = 1\n");
     assert!(

@@ -886,6 +886,9 @@ impl Parser<'_> {
             TokenKind::LBrace => self.dict_expr(),
             TokenKind::Kw(Kw::Inline) => self.inline_kb(),
             TokenKind::Kw(Kw::Menu) => self.menu_kb(),
+            TokenKind::Kw(Kw::State) => {
+                Err(self.err(span, "'state' здесь не переменная, используй get_state()"))
+            }
             TokenKind::Kw(k) => Err(self.err(
                 span,
                 format!("выражение не может начинаться с '{}'", kw_text(k)),

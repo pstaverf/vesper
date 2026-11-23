@@ -508,6 +508,10 @@ impl Scanner<'_> {
         let pair = ch.get(*i + 1).copied();
         let kind = match c {
             '"' => return self.sub_string(ch, i, ln),
+            '\\' if pair == Some('"') => {
+                *i += 1;
+                return self.sub_string(ch, i, ln);
+            }
             '(' | '[' | '{' => {
                 nest.push(c);
                 match c {
