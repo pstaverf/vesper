@@ -1,0 +1,8 @@
+[package]
+name = "vesper"
+version = "0.1.0"
+edition = "2021"
+description = "Vesper — язык для Telegram-ботов"
+license = "MIT"
+
+[dependencies]

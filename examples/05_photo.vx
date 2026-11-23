@@ -1,0 +1,15 @@
+bot "Фотобот"
+
+on command "start":
+    send("Пришли мне фото, и я его верну с подписью.")
+
+on photo:
+    size = len(msg.photo) - 1
+    file_id = msg.photo[size].file_id
+    send_photo(file_id, caption = "Твоё фото, {msg.from.first_name}")
+
+on document:
+    send_document(msg.document.file_id, caption = msg.document.file_name)
+
+on command "logo":
+    send_photo("https://core.telegram.org/img/t_logo.png", caption = "Логотип")
