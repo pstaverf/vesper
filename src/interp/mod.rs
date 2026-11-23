@@ -15,7 +15,8 @@ pub use builtins::{Builtin, BuiltinFunc};
 pub use env::{EnvCtx, FixedEnv, RealEnv};
 pub use value::Value;
 
-pub const MAX_DEPTH: usize = 200;
+pub const MAX_DEPTH: usize = 100;
+pub const STACK_SIZE: usize = 32 * 1024 * 1024;
 
 pub struct Ctx {
     pub globals: Rc<RefCell<BTreeMap<String, Value>>>,
@@ -65,6 +66,7 @@ pub enum Flow {
     Return(Value),
     Break,
     Continue,
+    Exit,
 }
 
 pub struct Run<'a> {
@@ -111,6 +113,19 @@ pub fn run_handler(
         Flow::Return(v) => Ok(v),
         _ => Ok(Value::Null),
     }
+}
+
+pub fn run_with_stack<T, F>(f: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(f)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("не удалось создать поток: {e}")))?
+        .join()
+        .map_err(|_| std::io::Error::other("поток интерпретатора упал"))
 }
 
 pub fn handler_table(program: &Program) -> Vec<(Option<String>, Handler)> {
@@ -165,7 +180,7 @@ impl<'a> Run<'a> {
     }
 
     fn lookup(&self, name: &str) -> Option<Value> {
-        for frame in self.locals.iter().rev() {
+        if let Some(frame) = self.locals.last() {
             if let Some(v) = frame.get(name) {
                 return Some(v.clone());
             }
@@ -194,6 +209,9 @@ impl<'a> Run<'a> {
     }
 
     pub fn exec(&mut self, stmt: &Stmt) -> Result<Flow, Diag> {
+        if self.ctx.exit.is_some() {
+            return Ok(Flow::Exit);
+        }
         match stmt {
             Stmt::Bot { .. } | Stmt::Handler(_) | Stmt::State { .. } | Stmt::Func { .. } => {
                 Ok(Flow::Normal)
@@ -221,6 +239,7 @@ impl<'a> Run<'a> {
                     }
                     match self.exec_block(body)? {
                         Flow::Break => break,
+                        Flow::Exit => return Ok(Flow::Exit),
                         Flow::Return(v) => return Ok(Flow::Return(v)),
                         _ => {}
                     }
@@ -235,6 +254,7 @@ impl<'a> Run<'a> {
                     self.assign(var, item);
                     match self.exec_block(body)? {
                         Flow::Break => break,
+                        Flow::Exit => return Ok(Flow::Exit),
                         Flow::Return(v) => return Ok(Flow::Return(v)),
                         _ => {}
                     }
@@ -255,6 +275,9 @@ impl<'a> Run<'a> {
     }
 
     fn store(&mut self, target: &Expr, v: Value) -> Result<(), Diag> {
+        if self.stopping() {
+            return Ok(());
+        }
         match target {
             Expr::Ident(name, _) => {
                 self.assign(name, v);
@@ -348,7 +371,14 @@ impl<'a> Run<'a> {
         }
     }
 
+    fn stopping(&self) -> bool {
+        self.ctx.exit.is_some()
+    }
+
     pub fn eval(&mut self, expr: &Expr) -> Result<Value, Diag> {
+        if self.stopping() {
+            return Ok(Value::Null);
+        }
         match expr {
             Expr::Null(_) => Ok(Value::Null),
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
@@ -434,6 +464,9 @@ impl<'a> Run<'a> {
             }
             Expr::Unary { op, expr, span } => {
                 let v = self.eval(expr)?;
+                if self.stopping() {
+                    return Ok(Value::Null);
+                }
                 match op {
                     UnOp::Neg => match v {
                         Value::Int(i) => i
@@ -464,6 +497,9 @@ impl<'a> Run<'a> {
     }
 
     fn index_get(&mut self, base: &Value, key: &Value, span: Span) -> Result<Value, Diag> {
+        if self.stopping() {
+            return Ok(Value::Null);
+        }
         match base {
             Value::List(l) => {
                 let idx = self.index_of(key, span)?;
@@ -524,6 +560,9 @@ impl<'a> Run<'a> {
         }
         let l = self.eval(lhs)?;
         let r = self.eval(rhs)?;
+        if self.stopping() {
+            return Ok(Value::Null);
+        }
         match op {
             BinOp::Add => self.add(&l, &r, span),
             BinOp::Sub => self.arith(&l, &r, span, "вычитания", arith_sub),
@@ -556,8 +595,6 @@ impl<'a> Run<'a> {
                 items.extend(b.borrow().iter().cloned());
                 Ok(Value::list(items))
             }
-            (Value::Int(a), Value::Float(b)) => float_checked((*a as f64) + b, self, span),
-            (Value::Float(a), Value::Int(b)) => float_checked(a + *b as f64, self, span),
             _ => self.arith(l, r, span, "сложения", arith_add),
         }
     }
@@ -577,8 +614,8 @@ impl<'a> Run<'a> {
         let ord = match (l, r) {
             (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Int(a), Value::Float(b)) => value::cmp_int_float(*a, *b),
+            (Value::Float(a), Value::Int(b)) => value::cmp_float_int(*a, *b),
             (Value::Str(a), Value::Str(b)) => Some(a.as_ref().cmp(b.as_ref())),
             (Value::List(a), Value::List(b)) => {
                 let a = a.borrow();
@@ -606,6 +643,9 @@ impl<'a> Run<'a> {
             }
             (Value::Map(_), Value::Map(_)) => {
                 return Err(self.diag(span, "словари нельзя сравнивать через '<' или '>'"))
+            }
+            (Value::Bool(_), Value::Bool(_)) => {
+                return Err(self.diag(span, "нельзя сравнить bool и bool через '<' или '>'"))
             }
             (a, b) if a.type_name() != b.type_name() => {
                 return Err(self.diag(
@@ -665,6 +705,9 @@ impl<'a> Run<'a> {
         args: &[crate::parser::ast::Arg],
         span: Span,
     ) -> Result<Value, Diag> {
+        if self.stopping() {
+            return Ok(Value::Null);
+        }
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
             other => {
@@ -730,7 +773,11 @@ impl<'a> Run<'a> {
             }
         }
         let f = builtin.func.clone();
-        f(self, &passed, span)
+        let out = f(self, &passed, span);
+        if self.stopping() {
+            return Ok(Value::Null);
+        }
+        out
     }
 
     fn call_user(
@@ -799,17 +846,18 @@ impl<'a> Run<'a> {
         self.ctx.stack.pop();
         self.locals.pop();
         match res? {
+            Flow::Exit => Ok(Value::Null),
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Null),
         }
     }
 }
 
-fn float_checked(v: f64, run: &Run<'_>, span: Span) -> Result<Value, Diag> {
+fn float_of(v: f64) -> Result<Value, String> {
     if v.is_finite() {
         return Ok(Value::Float(v));
     }
-    Err(run.diag(span, "переполнение при сложении: результат не число"))
+    Err("переполнение float: результат не число".to_string())
 }
 
 enum Nums {
@@ -837,7 +885,7 @@ fn arith_add(l: &Value, r: &Value) -> Result<Value, String> {
             .checked_add(b)
             .map(Value::Int)
             .ok_or_else(|| "переполнение int".to_string()),
-        Nums::Floats(a, b) => Ok(Value::Float(a + b)),
+        Nums::Floats(a, b) => float_of(a + b),
     }
 }
 
@@ -847,7 +895,7 @@ fn arith_sub(l: &Value, r: &Value) -> Result<Value, String> {
             .checked_sub(b)
             .map(Value::Int)
             .ok_or_else(|| "переполнение int".to_string()),
-        Nums::Floats(a, b) => Ok(Value::Float(a - b)),
+        Nums::Floats(a, b) => float_of(a - b),
     }
 }
 
@@ -857,7 +905,7 @@ fn arith_mul(l: &Value, r: &Value) -> Result<Value, String> {
             .checked_mul(b)
             .map(Value::Int)
             .ok_or_else(|| "переполнение int".to_string()),
-        Nums::Floats(a, b) => Ok(Value::Float(a * b)),
+        Nums::Floats(a, b) => float_of(a * b),
     }
 }
 
@@ -869,7 +917,7 @@ fn arith_div(l: &Value, r: &Value) -> Result<Value, String> {
     if b == 0.0 {
         return Err("деление на ноль".to_string());
     }
-    Ok(Value::Float(a / b))
+    float_of(a / b)
 }
 
 fn arith_floor_div(l: &Value, r: &Value) -> Result<Value, String> {
@@ -924,7 +972,7 @@ fn arith_mod(l: &Value, r: &Value) -> Result<Value, String> {
             if b == 0.0 {
                 return Err("остаток от деления на ноль".to_string());
             }
-            Ok(Value::Float(a % b))
+            float_of(a % b)
         }
     }
 }

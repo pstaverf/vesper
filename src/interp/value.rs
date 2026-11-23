@@ -1,6 +1,10 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::rc::Rc;
+
+pub const MAX_VALUE_DEPTH: usize = 100;
 
 #[derive(Clone)]
 pub enum Value {
@@ -59,51 +63,109 @@ impl Value {
     }
 
     pub fn equals(&self, other: &Value) -> bool {
-        match (self, other) {
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::List(a), Value::List(b)) => {
-                if Rc::ptr_eq(a, b) {
-                    return true;
-                }
-                let a = a.borrow();
-                let b = b.borrow();
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals(y))
-            }
-            (Value::Map(a), Value::Map(b)) => {
-                if Rc::ptr_eq(a, b) {
-                    return true;
-                }
-                let a = a.borrow();
-                let b = b.borrow();
-                a.len() == b.len()
-                    && a.iter()
-                        .all(|(k, v)| b.get(k).map(|o| v.equals(o)).unwrap_or(false))
-            }
-            _ => false,
-        }
+        equal_at(self, other, 0)
     }
 
     pub fn display(&self) -> String {
-        match self {
-            Value::Null => "null".to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Int(v) => v.to_string(),
-            Value::Float(v) => fmt_float(*v),
-            Value::Str(s) => s.to_string(),
-            Value::List(_) | Value::Map(_) => self.to_json().unwrap_or_else(|e| format!("<{e}>")),
-        }
+        display_at(self, 0)
     }
 
     pub fn to_json(&self) -> Result<String, String> {
         let mut out = String::new();
-        json_write(self, &mut out)?;
+        json_write(self, &mut out, 0)?;
         Ok(out)
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Null => f.write_str("null"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Float(v) => f.write_str(&fmt_float(*v)),
+            Value::Str(s) => write!(f, "{s:?}"),
+            Value::List(_) | Value::Map(_) => match self.to_json() {
+                Ok(t) => f.write_str(&t),
+                Err(e) => write!(f, "<{e}>"),
+            },
+        }
+    }
+}
+
+pub fn too_deep() -> String {
+    "цикл или слишком глубокая вложенность".to_string()
+}
+
+pub fn cmp_int_float(a: i64, b: f64) -> Option<Ordering> {
+    if b.is_nan() {
+        return None;
+    }
+    let hi = i64::MAX as f64;
+    if b == b.trunc() && b >= i64::MIN as f64 && b < hi {
+        return Some(a.cmp(&(b as i64)));
+    }
+    (a as f64).partial_cmp(&b)
+}
+
+pub fn cmp_float_int(a: f64, b: i64) -> Option<Ordering> {
+    cmp_int_float(b, a).map(|o| o.reverse())
+}
+
+fn equal_at(a: &Value, b: &Value, depth: usize) -> bool {
+    if depth > MAX_VALUE_DEPTH {
+        return false;
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Int(x), Value::Float(y)) => cmp_int_float(*x, *y) == Some(Ordering::Equal),
+        (Value::Float(x), Value::Int(y)) => cmp_float_int(*x, *y) == Some(Ordering::Equal),
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::List(x), Value::List(y)) => {
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            let x = x.borrow();
+            let y = y.borrow();
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(p, q)| equal_at(p, q, depth + 1))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            let x = x.borrow();
+            let y = y.borrow();
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).map(|o| equal_at(v, o, depth + 1)).unwrap_or(false))
+        }
+        _ => false,
+    }
+}
+
+fn display_at(v: &Value, depth: usize) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => fmt_float(*f),
+        Value::Str(s) => s.to_string(),
+        Value::List(_) | Value::Map(_) => {
+            if depth > MAX_VALUE_DEPTH {
+                return format!("<{}>", too_deep());
+            }
+            let mut out = String::new();
+            match json_write(v, &mut out, depth) {
+                Ok(()) => out,
+                Err(e) => format!("<{e}>"),
+            }
+        }
     }
 }
 
@@ -120,7 +182,10 @@ pub fn fmt_float(v: f64) -> String {
     format!("{v}")
 }
 
-fn json_write(v: &Value, out: &mut String) -> Result<(), String> {
+fn json_write(v: &Value, out: &mut String, depth: usize) -> Result<(), String> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(too_deep());
+    }
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -138,7 +203,7 @@ fn json_write(v: &Value, out: &mut String) -> Result<(), String> {
                 if i > 0 {
                     out.push(',');
                 }
-                json_write(item, out)?;
+                json_write(item, out, depth + 1)?;
             }
             out.push(']');
         }
@@ -150,7 +215,7 @@ fn json_write(v: &Value, out: &mut String) -> Result<(), String> {
                 }
                 json_str(k, out);
                 out.push(':');
-                json_write(item, out)?;
+                json_write(item, out, depth + 1)?;
             }
             out.push('}');
         }
@@ -177,7 +242,7 @@ fn json_str(s: &str, out: &mut String) {
 pub fn parse_json(s: &str) -> Result<Value, String> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
-    let v = json_value(&chars, &mut i)?;
+    let v = json_value(&chars, &mut i, 0)?;
     json_ws(&chars, &mut i);
     if i != chars.len() {
         return Err(format!("лишние символы после JSON, позиция {}", i + 1));
@@ -191,7 +256,10 @@ fn json_ws(c: &[char], i: &mut usize) {
     }
 }
 
-fn json_value(c: &[char], i: &mut usize) -> Result<Value, String> {
+fn json_value(c: &[char], i: &mut usize, depth: usize) -> Result<Value, String> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(too_deep());
+    }
     json_ws(c, i);
     let ch = match c.get(*i) {
         Some(ch) => *ch,
@@ -217,7 +285,7 @@ fn json_value(c: &[char], i: &mut usize) -> Result<Value, String> {
                     return Err(format!("ожидалось ':' после ключа, позиция {}", *i + 1));
                 }
                 *i += 1;
-                let v = json_value(c, i)?;
+                let v = json_value(c, i, depth + 1)?;
                 m.insert(key, v);
                 json_ws(c, i);
                 match c.get(*i) {
@@ -240,7 +308,7 @@ fn json_value(c: &[char], i: &mut usize) -> Result<Value, String> {
                 return Ok(Value::list(items));
             }
             loop {
-                items.push(json_value(c, i)?);
+                items.push(json_value(c, i, depth + 1)?);
                 json_ws(c, i);
                 match c.get(*i) {
                     Some(',') => *i += 1,

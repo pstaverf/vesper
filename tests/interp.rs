@@ -231,7 +231,7 @@ fn пример_3_запоминает_состояние_и_данные() {
     run_handler(&mut ctx, &program, &start.1, vars, &mut e).expect("start");
     assert_eq!(
         ctx.get_global("__state").map(|v| v.display()),
-        Some("\"name\"".to_string().trim_matches('"').to_string())
+        Some("name".to_string())
     );
     let name_state = table
         .iter()

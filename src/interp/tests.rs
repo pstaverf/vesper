@@ -3,21 +3,11 @@ use std::collections::BTreeMap;
 use super::builtins::Builtin;
 use super::value::{self, Value};
 use super::{parse_and_run, run_handler, Ctx, FixedEnv};
-use crate::diag::Span;
 use crate::parser::ast::Handler;
 use crate::parser::parse;
 
 fn env() -> FixedEnv {
     FixedEnv::new(1_700_000_000, vec![0.0, 0.25, 0.5, 0.999])
-}
-
-fn with_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(f)
-        .expect("поток")
-        .join()
-        .expect("без паники")
 }
 
 fn run(src: &str) -> Ctx {
@@ -38,14 +28,11 @@ fn eval_expr(expr: &str) -> Value {
 }
 
 fn err(src: &str) -> String {
-    let src = src.to_string();
-    with_stack(move || {
-        let mut e = env();
-        match parse_and_run(&src, "t.vx", &mut e) {
-            Ok(_) => panic!("ожидалась ошибка:\n{src}"),
-            Err(d) => d.render(&src),
-        }
-    })
+    let mut e = env();
+    match parse_and_run(src, "t.vx", &mut e) {
+        Ok(_) => panic!("ожидалась ошибка:\n{src}"),
+        Err(d) => d.render(src),
+    }
 }
 
 fn s(v: Value) -> String {
@@ -301,10 +288,174 @@ fn значения_по_умолчанию_и_именованные_аргум
 }
 
 #[test]
-fn лимит_глубины_рекурсии() {
-    let out = err("func boom(n):\n    return boom(n + 1)\nx = boom(0)\n");
-    assert!(out.contains("глубина рекурсии"), "{out}");
+fn лимит_глубины_рекурсии_на_стеке_2_мб() {
+    let out = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| err("func boom(n):\n    return boom(n + 1)\nx = boom(0)\n"))
+        .expect("поток")
+        .join()
+        .expect("без паники");
+    assert!(
+        out.contains("превышена глубина рекурсии (100 вызовов)"),
+        "{out}"
+    );
     assert!(out.contains("стек вызовов"), "{out}");
+}
+
+#[test]
+fn функция_не_видит_локальные_переменные_вызвавшего() {
+    let out = err(concat!(
+        "func f():\n",
+        "    return x\n",
+        "func g():\n",
+        "    x = 5\n",
+        "    return f()\n",
+        "z = g()\n",
+    ));
+    assert!(out.contains("неизвестное имя 'x'"), "{out}");
+    let out = err(concat!(
+        "func g():\n",
+        "    y = 1\n",
+        "    return h()\n",
+        "func h():\n",
+        "    return y\n",
+        "z = g()\n",
+    ));
+    assert!(out.contains("неизвестное имя 'y'"), "{out}");
+    let ctx = run("z = 7\nfunc f():\n    return z\nx = f()\n");
+    assert_eq!(s(ctx.get_global("x").unwrap()), "7");
+    let out = err(concat!(
+        "func f():\n",
+        "    v = 1\n",
+        "    return v\n",
+        "a = f()\n",
+        "b = v\n",
+    ));
+    assert!(out.contains("неизвестное имя 'v'"), "{out}");
+}
+
+#[test]
+fn цикл_в_списке_не_вешает_json_и_display() {
+    let out = err("a = []\npush(a, a)\nr1 = json(a)\n");
+    assert!(
+        out.contains("цикл или слишком глубокая вложенность"),
+        "{out}"
+    );
+    let ctx = run("a = []\npush(a, a)\nr2 = str(a)\nr3 = a == a\n");
+    let r2 = s(ctx.get_global("r2").unwrap());
+    assert!(r2.contains("цикл или слишком глубокая вложенность"), "{r2}");
+    assert_eq!(s(ctx.get_global("r3").unwrap()), "true");
+}
+
+#[test]
+fn цикл_в_словаре_не_вешает_json_и_display() {
+    let out = err("a = {}\na[\"x\"] = a\nr1 = json(a)\n");
+    assert!(
+        out.contains("цикл или слишком глубокая вложенность"),
+        "{out}"
+    );
+    let ctx = run("a = {}\na[\"x\"] = a\nr2 = str(a)\nr3 = a == a\n");
+    let r2 = s(ctx.get_global("r2").unwrap());
+    assert!(r2.contains("цикл или слишком глубокая вложенность"), "{r2}");
+    assert_eq!(s(ctx.get_global("r3").unwrap()), "true");
+}
+
+#[test]
+fn цикл_не_вешает_сравнение_двух_разных_значений() {
+    let ctx = run(concat!(
+        "a = []\n",
+        "push(a, a)\n",
+        "b = []\n",
+        "push(b, b)\n",
+        "r = a == b\n",
+        "l = [a]\n",
+        "m = [b]\n",
+        "r2 = l == m\n",
+    ));
+    assert_eq!(s(ctx.get_global("r").unwrap()), "false");
+    assert_eq!(s(ctx.get_global("r2").unwrap()), "false");
+}
+
+#[test]
+fn цикл_в_выводе_значения_не_падает() {
+    let v = Value::list(vec![]);
+    if let Value::List(l) = &v {
+        l.borrow_mut().push(v.clone());
+    }
+    assert!(v
+        .display()
+        .contains("цикл или слишком глубокая вложенность"));
+    assert!(format!("{v:?}").contains("цикл или слишком глубокая вложенность"));
+    assert!(v.to_json().is_err());
+    assert!(v.equals(&v));
+}
+
+#[test]
+fn exit_прерывает_цикл_функцию_и_обработчик() {
+    let ctx = run("i = 0\nwhile true:\n    i = i + 1\n    if i == 3:\n        exit(0)\n");
+    assert_eq!(s(ctx.get_global("i").unwrap()), "3");
+    assert_eq!(ctx.exit, Some(0));
+
+    let ctx = run(concat!(
+        "func f():\n",
+        "    exit(5)\n",
+        "    return 1\n",
+        "x = f()\n",
+        "y = 2\n",
+    ));
+    assert_eq!(ctx.exit, Some(5));
+    assert_eq!(s(ctx.get_global("y").unwrap_or(Value::Null)), "null");
+
+    let ctx = run("n = 0\nfor i in [1, 2, 3, 4]:\n    n = i\n    exit(0)\n");
+    assert_eq!(s(ctx.get_global("n").unwrap()), "1");
+    assert_eq!(ctx.exit, Some(0));
+
+    let mut ctx = Ctx::new("t.vx");
+    let program = parse(
+        "on text:\n    log(\"a\")\n    exit(3)\n    log(\"b\")\n",
+        "t.vx",
+    )
+    .unwrap();
+    let mut e = env();
+    let table = super::handler_table(&program);
+    let v = run_handler(&mut ctx, &program, &table[0].1, BTreeMap::new(), &mut e).unwrap();
+    assert!(matches!(v, Value::Null));
+    assert_eq!(ctx.exit, Some(3));
+    assert_eq!(ctx.logs, vec!["a".to_string()]);
+}
+
+#[test]
+fn сравнение_int_и_float_точно_выше_2_в_53() {
+    assert_eq!(
+        s(eval_expr("9007199254740993 == 9007199254740992.0")),
+        "false"
+    );
+    assert_eq!(
+        s(eval_expr("9007199254740992 == 9007199254740992.0")),
+        "true"
+    );
+    assert_eq!(
+        s(eval_expr("9007199254740993 > 9007199254740992.0")),
+        "true"
+    );
+    assert_eq!(s(eval_expr("1 == 1.0")), "true");
+}
+
+#[test]
+fn bool_не_сравнивается_через_меньше() {
+    assert!(err("x = true < false\n").contains("нельзя сравнить bool и bool"));
+    assert!(err("x = true >= false\n").contains("нельзя сравнить bool и bool"));
+    assert_eq!(s(eval_expr("true == true")), "true");
+    assert_eq!(s(eval_expr("true != false")), "true");
+}
+
+#[test]
+fn ошибка_переполнения_float() {
+    assert!(err("x = 1e308 * 1e308\n").contains("переполнение float"));
+    assert!(err("x = -1e308 - 1e308\n").contains("переполнение float"));
+    assert!(err("x = 1e308 * 10.0\n").contains("переполнение float"));
+    assert!(err("x = 1e308 / 1e-308\n").contains("переполнение float"));
+    assert_eq!(s(eval_expr("1.0 / 2.0")), "0.5");
 }
 
 #[test]
@@ -590,8 +741,8 @@ fn example_env(ctx: &mut Ctx) {
     );
 }
 
-fn run_example(name: &'static str, src: &'static str) {
-    with_stack(move || run_example_inner(name, src));
+fn run_example(name: &str, src: &str) {
+    run_example_inner(name, src);
 }
 
 fn run_example_inner(name: &str, src: &str) {
@@ -853,9 +1004,4 @@ fn ошибка_с_позицией_и_стеком() {
     assert!(out.contains("t.vx:4:12"), "{out}");
     assert!(out.contains("деление на ноль"), "{out}");
     assert!(out.contains("a → b"), "{out}");
-}
-
-#[test]
-fn span_доступен_в_тестах() {
-    let _ = Span::new(1, 1, 1);
 }
