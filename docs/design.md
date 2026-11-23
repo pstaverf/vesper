@@ -117,6 +117,15 @@ vesper/
 `api/spec.json` — снимок спецификации (лежит в репозитории, чтобы сборка не ходила в сеть).
 Источник: community-спецификация `github.com/PaulSonOfLars/telegram-bot-api-spec` (MIT, обновляется ежедневно, машиночитаемый JSON). Проверено вживую 2026-11-23: `version = "Bot API 10.5"`, `release_date = "November 22, 2026"`, 194 метода, 426 типов. Формат: `{version, release_date, changelog, methods:{имя:{fields:[{name,types[],required,description}], returns[]}}, types:{...}}`; типы значений — `Integer`, `Float`, `String`, `Boolean`, `Array of X`.
 
+## Заметки для парсера (этап 2)
+
+- Имена именованных аргументов могут совпадать с ключевыми словами: `send("x", inline = kb)`,
+  `send("x", menu = menu[["Да"]])`, `send("x", link = ...)`, `send("x", switch = ...)`.
+  Парсер обязан принимать `Kw(...)` в позиции имени аргумента, лексер при этом не меняется.
+- Подстановка `{…}` приходит из лексера уже разобранной на токены (`StrPart::Expr`).
+  У неё собственная вложенность скобок: скобки внутри `{…}` не влияют на `INDENT`/`DEDENT`
+  и на стек скобок внешнего выражения. Парсер разбирает эти токены как обычное выражение.
+
 ## Слой API и обновляемость
 
 `tools/gen_api` (Rust bin, входит в workspace) читает `api/spec.json`:

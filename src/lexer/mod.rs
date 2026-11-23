@@ -38,7 +38,15 @@ pub fn lex(src: &str, file: &str) -> Result<Vec<Token>, Diag> {
     Ok(sc.out)
 }
 
-impl<'a> Scanner<'a> {
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_ident_part(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+impl Scanner<'_> {
     fn err(&self, line: u32, col: u32, len: u32, text: impl Into<String>) -> Diag {
         Diag::new(self.file, Span::new(line, col, len), text)
     }
@@ -63,7 +71,8 @@ impl<'a> Scanner<'a> {
             i += 1;
             indent += 1;
         }
-        if ch[i..].iter().all(|c| *c == ' ' || *c == '\t') || ch.get(i) == Some(&'#') {
+        let blank = ch[i..].iter().all(|c| *c == ' ' || *c == '\t') || ch.get(i) == Some(&'#');
+        if blank {
             return Ok(());
         }
         if ch[i] == '\t' {
@@ -410,78 +419,14 @@ impl<'a> Scanner<'a> {
                     break;
                 }
                 '\\' => {
-                    let lit = match ch.get(*i + 1).copied() {
-                        Some('n') => '\n',
-                        Some('t') => '\t',
-                        Some('\\') => '\\',
-                        Some('"') => '"',
-                        Some('{') => '{',
-                        Some('}') => '}',
-                        Some(other) => {
-                            return Err(self.err(
-                                ln,
-                                *i as u32 + 1,
-                                2,
-                                format!("неизвестная escape-последовательность '\\{other}'"),
-                            ));
-                        }
-                        None => {
-                            return Err(self.err(
-                                ln,
-                                *i as u32 + 1,
-                                1,
-                                "escape-последовательность оборвана",
-                            ))
-                        }
-                    };
-                    buf.push(lit);
+                    buf.push(self.escape(ch, i, ln)?);
                     *i += 2;
                 }
                 '{' => {
                     if !buf.is_empty() {
                         parts.push(StrPart::Text(std::mem::take(&mut buf)));
                     }
-                    let brace = *i as u32 + 1;
-                    *i += 1;
-                    let base = self.depth.len();
-                    self.depth.push(('{', ln, brace));
-                    let mut toks = Vec::new();
-                    loop {
-                        if *i >= ch.len() {
-                            return Err(self.err(ln, brace, 1, "незакрытая подстановка: нет '}'"));
-                        }
-                        let e = ch[*i];
-                        if e == ' ' {
-                            *i += 1;
-                            continue;
-                        }
-                        if e == '\t' {
-                            return Err(self.err(
-                                ln,
-                                *i as u32 + 1,
-                                1,
-                                "табуляция недопустима в подстановке",
-                            ));
-                        }
-                        if e == '}' && self.depth.len() == base + 1 {
-                            self.depth.pop();
-                            *i += 1;
-                            break;
-                        }
-                        let start = *i;
-                        let kind = self.token(ch, i, ln)?;
-                        toks.push(Token::new(
-                            kind,
-                            Span::new(ln, start as u32 + 1, (*i - start) as u32),
-                        ));
-                    }
-                    if toks.is_empty() {
-                        return Err(self.err(ln, brace, 1, "пустая подстановка '{}'"));
-                    }
-                    parts.push(StrPart::Expr {
-                        tokens: toks,
-                        span: Span::new(ln, brace, 1),
-                    });
+                    parts.push(self.substitution(ch, i, ln)?);
                 }
                 _ => {
                     buf.push(c);
@@ -494,12 +439,212 @@ impl<'a> Scanner<'a> {
         }
         Ok(TokenKind::Str(parts))
     }
-}
 
-fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
+    fn escape(&self, ch: &[char], i: &mut usize, ln: u32) -> Result<char, Diag> {
+        let col = *i as u32 + 1;
+        match ch.get(*i + 1).copied() {
+            Some('n') => Ok('\n'),
+            Some('t') => Ok('\t'),
+            Some('\\') => Ok('\\'),
+            Some('"') => Ok('"'),
+            Some('{') => Ok('{'),
+            Some('}') => Ok('}'),
+            Some(other) => Err(self.err(
+                ln,
+                col,
+                2,
+                format!("неизвестная escape-последовательность '\\{other}'"),
+            )),
+            None => Err(self.err(ln, col, 1, "escape-последовательность оборвана")),
+        }
+    }
 
-fn is_ident_part(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    fn substitution(&mut self, ch: &[char], i: &mut usize, ln: u32) -> Result<StrPart, Diag> {
+        let brace = *i as u32 + 1;
+        *i += 1;
+        let mut nest: Vec<char> = Vec::new();
+        let mut toks = Vec::new();
+        loop {
+            if *i >= ch.len() {
+                return Err(self.err(ln, brace, 1, "незакрытая подстановка: нет '}'"));
+            }
+            let c = ch[*i];
+            if c == ' ' {
+                *i += 1;
+                continue;
+            }
+            if c == '\t' {
+                return Err(self.err(ln, *i as u32 + 1, 1, "табуляция недопустима в подстановке"));
+            }
+            if c == '}' && nest.is_empty() {
+                *i += 1;
+                break;
+            }
+            let start = *i;
+            let kind = self.sub_token(&mut nest, ch, i, ln)?;
+            toks.push(Token::new(
+                kind,
+                Span::new(ln, start as u32 + 1, (*i - start) as u32),
+            ));
+        }
+        if toks.is_empty() {
+            return Err(self.err(ln, brace, 1, "пустая подстановка '{}'"));
+        }
+        Ok(StrPart::Expr {
+            tokens: toks,
+            span: Span::new(ln, brace, 1),
+        })
+    }
+
+    fn sub_token(
+        &mut self,
+        nest: &mut Vec<char>,
+        ch: &[char],
+        i: &mut usize,
+        ln: u32,
+    ) -> Result<TokenKind, Diag> {
+        let col = *i as u32 + 1;
+        let c = ch[*i];
+        let pair = ch.get(*i + 1).copied();
+        let kind = match c {
+            '"' => return self.sub_string(ch, i, ln),
+            '(' | '[' | '{' => {
+                nest.push(c);
+                match c {
+                    '(' => TokenKind::LParen,
+                    '[' => TokenKind::LBracket,
+                    _ => TokenKind::LBrace,
+                }
+            }
+            ')' | ']' | '}' => {
+                let want = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                match nest.pop() {
+                    Some(open) if open == want => match c {
+                        ')' => TokenKind::RParen,
+                        ']' => TokenKind::RBracket,
+                        _ => TokenKind::RBrace,
+                    },
+                    Some(open) => {
+                        return Err(self.err(
+                            ln,
+                            col,
+                            1,
+                            format!("в подстановке '{c}' не закрывает открытую '{open}'"),
+                        ))
+                    }
+                    None => {
+                        return Err(self.err(
+                            ln,
+                            col,
+                            1,
+                            format!("в подстановке лишняя закрывающая скобка '{c}'"),
+                        ))
+                    }
+                }
+            }
+            '+' => TokenKind::Plus,
+            '-' => {
+                if pair == Some('>') {
+                    *i += 1;
+                    TokenKind::Arrow
+                } else {
+                    TokenKind::Minus
+                }
+            }
+            '*' => TokenKind::Star,
+            '/' => {
+                if pair == Some('/') {
+                    *i += 1;
+                    TokenKind::SlashSlash
+                } else {
+                    TokenKind::Slash
+                }
+            }
+            '%' => TokenKind::Percent,
+            '=' => {
+                if pair == Some('=') {
+                    *i += 1;
+                    TokenKind::Eq
+                } else {
+                    TokenKind::Assign
+                }
+            }
+            '!' if pair == Some('=') => {
+                *i += 1;
+                TokenKind::Ne
+            }
+            '?' if pair == Some('?') => {
+                *i += 1;
+                TokenKind::Coalesce
+            }
+            '<' => {
+                if pair == Some('=') {
+                    *i += 1;
+                    TokenKind::Le
+                } else {
+                    TokenKind::Lt
+                }
+            }
+            '>' => {
+                if pair == Some('=') {
+                    *i += 1;
+                    TokenKind::Ge
+                } else {
+                    TokenKind::Gt
+                }
+            }
+            '.' => TokenKind::Dot,
+            ',' => TokenKind::Comma,
+            ':' => TokenKind::Colon,
+            _ if c.is_ascii_digit() => return self.number(ch, i, ln),
+            _ if is_ident_start(c) => {
+                let start = *i;
+                while *i < ch.len() && is_ident_part(ch[*i]) {
+                    *i += 1;
+                }
+                let word: String = ch[start..*i].iter().collect();
+                return Ok(match word.as_str() {
+                    "true" => TokenKind::Bool(true),
+                    "false" => TokenKind::Bool(false),
+                    "null" => TokenKind::Null,
+                    _ => TokenKind::Ident(word),
+                });
+            }
+            _ => {
+                return Err(self.err(ln, col, 1, format!("недопустимый символ '{c}'")));
+            }
+        };
+        *i += 1;
+        Ok(kind)
+    }
+
+    fn sub_string(&mut self, ch: &[char], i: &mut usize, ln: u32) -> Result<TokenKind, Diag> {
+        let open = *i as u32 + 1;
+        *i += 1;
+        let mut buf = String::new();
+        loop {
+            if *i >= ch.len() {
+                return Err(self.err(ln, open, 1, "незакрытая строка в подстановке"));
+            }
+            match ch[*i] {
+                '"' => {
+                    *i += 1;
+                    break;
+                }
+                '\\' => {
+                    buf.push(self.escape(ch, i, ln)?);
+                    *i += 2;
+                }
+                c => {
+                    buf.push(c);
+                    *i += 1;
+                }
+            }
+        }
+        Ok(TokenKind::Str(vec![StrPart::Text(buf)]))
+    }
 }

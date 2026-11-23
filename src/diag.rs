@@ -18,6 +18,8 @@ pub struct Diag {
     pub text: String,
 }
 
+const TAB_WIDTH: usize = 4;
+
 impl Diag {
     pub fn new(file: &str, span: Span, text: impl Into<String>) -> Diag {
         Diag {
@@ -34,21 +36,27 @@ impl Diag {
             "{}:{}:{}: ошибка: {}",
             self.file, self.span.line, self.span.col, self.text
         );
+        let index = (self.span.line as usize).saturating_sub(1);
         let raw = src
             .split('\n')
-            .nth(self.span.line as usize - 1)
+            .nth(index)
             .unwrap_or("")
             .trim_end_matches('\r');
-        let shown = raw.replace('\t', "    ");
-        let before = self.span.col as usize - 1;
-        let indent: String = raw
-            .chars()
-            .take(before)
-            .map(|c| if c == '\t' { "    " } else { " " })
-            .collect();
-        let width = shown.chars().count().max(before + 1);
-        let len = (self.span.len as usize).max(1);
-        let carets = "^".repeat(len.min(width.saturating_sub(before)));
+        let shown = expand(raw);
+        let before = self.span.col.saturating_sub(1) as usize;
+        let indent = " ".repeat(display_width(&raw.chars().take(before).collect::<String>()));
+        let left = (display_width(&shown) + 1).saturating_sub(indent.len());
+        let carets = "^".repeat((self.span.len as usize).max(1).min(left).max(1));
         format!("{head}\n  {num} | {shown}\n  {pad} | {indent}{carets}")
     }
+}
+
+fn expand(raw: &str) -> String {
+    raw.replace('\t', &" ".repeat(TAB_WIDTH))
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| if c == '\t' { TAB_WIDTH } else { 1 })
+        .sum()
 }
