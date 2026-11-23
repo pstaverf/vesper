@@ -24,3 +24,10 @@ on command "profile":
     else:
         c = load("city")
         send("Имя: " + n + "\nГород: " + c)
+
+on command "status":
+    cur = get_state()
+    if cur == null:
+        send("Сейчас ничего не запрашиваю")
+    else:
+        send("Сейчас спрашиваю: " + cur)
